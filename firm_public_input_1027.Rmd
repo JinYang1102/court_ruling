@@ -1,0 +1,153 @@
+---
+title: "public firm input"
+output: html_document
+date: "2025-10-21"
+---
+
+
+# Install required package
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(readxl)
+library(readr)
+library(writexl)
+library(dplyr)
+library(data.table)
+```
+
+
+# Construct litigation exposure
+
+## We first define the window of interest
+```{r}
+data <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/Firm_patent_merged_result.csv")
+
+data <- data %>%
+  mutate(year = floor(fyearq))
+
+data_2011_2017 <- data %>%
+  filter(year >= 2011, year <= 2017)
+
+fwrite(data_2011_2017, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_2011_2017.csv")
+```
+
+## For each public firm, we construct the sample of patents before 2014Q1
+```{r}
+data <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/Firm_patent_merged_result.csv")
+data_1970_2014Q1 <- data %>%
+  filter(fyearq >= 1970, fyearq < 2014 | (fyearq == 2014 & fqtr == 1))
+
+fwrite(data_1970_2014Q1, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_1970_2014Q1.csv")
+```
+
+## Filter the sample of patents before 2014Q1 by GVKEY in the sample of interest
+```{r}
+main_sample <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_2011_2017.csv")
+weight_pre <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_1970_2014Q1.csv")
+filtered_weight_pre <- weight_pre %>%
+  filter(GVKEY %in% main_sample$GVKEY)
+
+fwrite(filtered_weight_pre, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_filtered_1027.csv")
+```
+
+## Calculate class weight for each public firm
+```{r}
+firm <- as.data.table(read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_filtered_1027.csv"))
+
+firm[, patent_list := as.character(patent_list)]
+
+firm_long <- firm[
+  ,
+  .(patent = unlist(strsplit(patent_list, ";", fixed = TRUE))),
+  by = .(GVKEY, fyearq, fqtr, conm)
+]
+
+firm_long[, patent := trimws(patent)]
+firm_long <- firm_long[patent != "" & !is.na(patent)]
+firm_long[, patent := gsub("[^0-9]", "", patent)]
+
+cpc <- fread("/Users/qiandu/Desktop/2025_summer/input_public_sample/pv_g_cpc_first.csv.gz")
+cpc[, patent_id := gsub("[^0-9]", "", as.character(patent_id))]
+
+firm_cpc <- merge(
+  firm_long,
+  cpc,
+  by.x = "patent",
+  by.y = "patent_id",
+  all.x = FALSE,
+  all.y = FALSE
+)
+
+if (!"cpc_class" %in% names(firm_cpc) && "cpc_subclass" %in% names(firm_cpc)) {
+  firm_cpc[, cpc_class := substr(cpc_subclass, 1, 3)]
+}
+
+firm_cpc <- firm_cpc[!is.na(cpc_class) & cpc_class != ""]
+
+if ("cpc_subclass" %in% names(firm_cpc)) {
+  firm_cpc[, cpc_subclass_clean := toupper(trimws(cpc_subclass))]
+} else {
+  firm_cpc[, cpc_subclass_clean := NA_character_]
+}
+
+firm_cpc <- firm_cpc[
+  !(
+    substr(cpc_subclass_clean, 1, 4) == "G06Q" &
+    (
+      fyearq > 2014 |
+      (fyearq == 2014 & fqtr >= 2)
+    )
+  )
+]
+
+gvkey_cpc <- firm_cpc[
+  ,
+  .N,
+  by = .(GVKEY, cpc_class)
+]
+setnames(gvkey_cpc, "N", "patent_count")
+
+total_patent <- gvkey_cpc[
+  ,
+  .(total = sum(patent_count)),
+  by = GVKEY
+]
+
+gvkey_cpc <- merge(gvkey_cpc, total_patent, by = "GVKEY")
+gvkey_cpc[, weight := patent_count / total]
+
+cpc_info <- fread("/Users/qiandu/Desktop/2025_summer/input_public_sample/cpc_subclass_scheme.csv")
+cpc_class_info <- unique(cpc_info[, .(cpc_class = cpc_class, cpc_class_title = cpc_class_title)])
+
+gvkey_cpc <- merge(gvkey_cpc, cpc_class_info, by = "cpc_class", all.x = TRUE)
+
+fwrite(gvkey_cpc, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_gvkey_weight_1027.csv")
+```
+
+## We then aggregate this measure up at firm level: this is weighted average of reversal rate
+```{r}
+w <- fread("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_gvkey_weight_1027.csv")[, .(GVKEY, cpc_class, weight)]
+r <- as.data.table(read_excel("/Users/qiandu/Desktop/2025_summer/reversal_rate/reversal_rate_1027.xlsx", sheet = 1))
+setnames(r, c("cpc_class", "reversal_rate"))
+
+w_r <- merge(w, r[, .(cpc_class, reversal_rate)], by = "cpc_class", all.x = TRUE)
+
+exposure <- w_r[, .(exposure = sum(weight * reversal_rate, na.rm = TRUE)), by = GVKEY]
+
+fwrite(exposure, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_gvkey_exposure_1027.csv")
+```
+
+## Construct main sample with exposure
+```{r}
+main <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_2011_2017.csv")
+exp <- read_csv("/Users/qiandu/Desktop/2025_summer/input_public_sample/public_gvkey_exposure_1027.csv")
+
+main$GVKEY <- as.character(main$GVKEY)
+exp$GVKEY <- as.character(exp$GVKEY)
+
+main2 <- main %>%
+  left_join(exp, by = "GVKEY") %>%
+  mutate(exposure = ifelse(is.na(exposure), 0, exposure))
+
+fwrite(main2, "/Users/qiandu/Desktop/2025_summer/input_public_sample/public_sample_1027.csv")
+```
